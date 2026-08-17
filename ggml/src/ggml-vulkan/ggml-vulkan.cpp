@@ -257,6 +257,7 @@ enum vk_device_architecture {
     INTEL_XE2,
     NVIDIA_PRE_TURING,
     NVIDIA_TURING,
+    ARM_MALI,
 };
 
 static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& device) {
@@ -365,6 +366,14 @@ static vk_device_architecture get_device_architecture(const vk::PhysicalDevice& 
             // Turing has 32, following architectures have 48
             if (sm_props.shaderWarpsPerSM == 32) {
                 return vk_device_architecture::NVIDIA_TURING;
+            }
+        }
+    } else if (props.vendorID == VK_VENDOR_ID_ARM) {
+        const std::vector<vk::ExtensionProperties> ext_props = device.enumerateDeviceExtensionProperties();
+        for (const auto & properties : ext_props) {
+            if (strcmp("VK_ARM_shader_core_properties", properties.extensionName) == 0 ||
+                strcmp("VK_ARM_shader_core_builtins", properties.extensionName) == 0) {
+                return vk_device_architecture::ARM_MALI;
             }
         }
     }
@@ -5308,6 +5317,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     bool coopmat2_support = false;
     bool integer_dot_product = false;
     bool bfloat16_support = false;
+    bool arm_shader_core_properties_support = false;
+    bool arm_shader_core_builtins_support = false;
 
     for (auto properties : ext_props) {
         if (strcmp("VK_KHR_16bit_storage", properties.extensionName) == 0) {
@@ -5334,6 +5345,10 @@ static void ggml_vk_print_gpu_info(size_t idx) {
                     !getenv("GGML_VK_DISABLE_BFLOAT16")) {
             bfloat16_support = true;
 #endif
+        } else if (strcmp("VK_ARM_shader_core_properties", properties.extensionName) == 0) {
+            arm_shader_core_properties_support = true;
+        } else if (strcmp("VK_ARM_shader_core_builtins", properties.extensionName) == 0) {
+            arm_shader_core_builtins_support = true;
         }
     }
 
@@ -5349,6 +5364,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     vk::PhysicalDeviceSubgroupProperties subgroup_props;
     vk::PhysicalDeviceDriverProperties driver_props;
     vk::PhysicalDeviceShaderIntegerDotProductPropertiesKHR shader_integer_dot_product_props;
+    vk::PhysicalDeviceShaderCorePropertiesARM arm_shader_core_props;
+    vk::PhysicalDeviceShaderCoreBuiltinsPropertiesARM arm_shader_core_builtins_props;
     props2.pNext = &props3;
     props3.pNext = &subgroup_props;
     subgroup_props.pNext = &driver_props;
@@ -5359,6 +5376,14 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     if (integer_dot_product) {
         last_struct->pNext = (VkBaseOutStructure *)&shader_integer_dot_product_props;
         last_struct = (VkBaseOutStructure *)&shader_integer_dot_product_props;
+    }
+    if (device_architecture == vk_device_architecture::ARM_MALI && arm_shader_core_properties_support) {
+        last_struct->pNext = (VkBaseOutStructure *)&arm_shader_core_props;
+        last_struct = (VkBaseOutStructure *)&arm_shader_core_props;
+    }
+    if (device_architecture == vk_device_architecture::ARM_MALI && arm_shader_core_builtins_support) {
+        last_struct->pNext = (VkBaseOutStructure *)&arm_shader_core_builtins_props;
+        last_struct = (VkBaseOutStructure *)&arm_shader_core_builtins_props;
     }
 
     physical_device.getProperties2(&props2);
@@ -5435,9 +5460,19 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     std::string matrix_cores = coopmat2_support ? "NV_coopmat2" : coopmat_support ? "KHR_coopmat" : "none";
 
     std::string device_name = props2.properties.deviceName.data();
-    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %d | bf16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
-              idx, device_name.c_str(), driver_props.driverName.data(), uma, fp16, bf16, subgroup_size,
+    const char * architecture_name = device_architecture == vk_device_architecture::ARM_MALI ? "ARM_MALI" : "generic";
+    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | arch: %s | uma: %d | fp16: %d | bf16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+              idx, device_name.c_str(), driver_props.driverName.data(), architecture_name, uma, fp16, bf16, subgroup_size,
               props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
+    if (device_architecture == vk_device_architecture::ARM_MALI && arm_shader_core_properties_support) {
+        GGML_LOG_DEBUG("ggml_vulkan: ARM shader core rates: pixel=%u texel=%u fma=%u\n",
+                       arm_shader_core_props.pixelRate, arm_shader_core_props.texelRate, arm_shader_core_props.fmaRate);
+    }
+    if (device_architecture == vk_device_architecture::ARM_MALI && arm_shader_core_builtins_support) {
+        GGML_LOG_DEBUG("ggml_vulkan: ARM shader cores: count=%u warps_per_core=%u mask=0x%llx\n",
+                       arm_shader_core_builtins_props.shaderCoreCount, arm_shader_core_builtins_props.shaderWarpsPerCore,
+                       static_cast<unsigned long long>(arm_shader_core_builtins_props.shaderCoreMask));
+    }
 
     if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
         GGML_LOG_DEBUG("ggml_vulkan: Warning: Device type is CPU. This is probably not the device you want.\n");
