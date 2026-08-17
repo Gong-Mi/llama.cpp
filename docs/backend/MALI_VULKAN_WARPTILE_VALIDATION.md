@@ -84,3 +84,22 @@ The existing capability-report PR proves ARM Mali identification and runtime cap
 A previous experiment that directly changed the generic subgroup-32 specialization did not produce a reproducible performance benefit. That experiment is not evidence against a properly isolated warptile candidate; it is evidence that subgroup-size replacement and warptile tuning must not be conflated.
 
 This draft remains documentation-only until one candidate passes the correctness and ordered benchmark matrix above.
+
+## Evidence collected after opening this draft
+
+The current upstream source already contains an ARM vendor-specific medium-tile selection in `ggml/src/ggml-vulkan/ggml-vulkan.cpp` (the branch beginning at `device->vendor_id == VK_VENDOR_ID_ARM && device->subgroup_size >= 16`). A new patch must not duplicate that branch or claim it as new work.
+
+On the target device, the capability-report build produced this baseline with the existing runtime selection:
+
+```text
+model: Gemma 3 4B Q4_0
+GPU layers: 99
+prompt: 128 tokens, 3 repetitions
+generation: 128 tokens, 3 repetitions
+prompt: 60.0363 tok/s ± 0.1581
+generation: 10.3982 tok/s ± 0.3375
+```
+
+A direct experiment that replaced the generic subgroup-32 specialization with subgroup 16 was also run, but it is not a valid warptile patch and did not provide reproducible evidence. Ordered runs were affected by device thermal/DVFS state. It is therefore excluded from the runtime patch set.
+
+The next runtime candidate, if pursued, must target one exact existing pipeline (for example small quantized MMQ) and change only its warptile values. The candidate must first demonstrate that it is not already covered by the existing ARM medium-tile branch.
