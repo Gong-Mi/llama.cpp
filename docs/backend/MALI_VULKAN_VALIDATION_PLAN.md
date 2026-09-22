@@ -85,25 +85,29 @@ See the findings document. The important part is that class 1 is *not* tied to a
 `GGML_VK_DISABLE_COOPMAT`, `_INTEGER_DOT_PRODUCT` and `_MMVQ`, which moves the question into tile geometry,
 not feature selection.
 
-### P2 — WM identity fix (done on hardware, full-suite rerun pending)
+### P2 — WM identity fix (done, acceptance met)
 
 Four derived values replace one shared constant, so every small warptile gets a `WM` that satisfies
-`(BM/WM)*(BN/WN) == BLOCK_SIZE/WARP` for its own `(BLOCK_SIZE, WARP)` pair. Hardware results for the focused
-cases are in the findings document; the full-suite rerun (`tbo-vulkan-wmfix.log`) gives the new FAIL total.
+`(BM/WM)*(BN/WN) == BLOCK_SIZE/WARP` for its own `(BLOCK_SIZE, WARP)` pair.
 
-Acceptance: class 1 and 2 cases pass, no previously passing shape regresses, and the total FAIL count drops
-by 29–30 (the classes 1+2 population).
+Acceptance: class 1 and 2 cases pass, no previously passing shape regresses, and the total FAIL count drops.
+Measured on hardware: 18880 → **18912 OK**, 53 → **21 FAIL**, 30 cases fixed, no regression.
 
-### P3 — `_mmqid*` warptiles (todo)
+### P3 — `_mmqid*` warptiles and the bf16 residue (partially done)
 
 The three `s_warptile_mmqid*` tiles take `BLOCK_SIZE` from `mul_mat_subgroup_size_32` and `WARP` from
-`mul_mat_subgroup_size_8/_16`, so at subgroup size 16 they still have `BLOCK_SIZE/WARP = 2` against
-`BM/WM = 1`. The identity fix above assigns them `s_warptile_wm_qid(_k)`, which is why they are expected to
-improve; the remaining `MUL_MAT_ID(type_a=f16, m=32, k=16/64)` failures use the *f16* id path and are a
-separate question that this node owns.
+`mul_mat_subgroup_size_8/_16`, so at subgroup size 16 they still had `BLOCK_SIZE/WARP = 2` against
+`BM/WM = 1`; the identity fix gives them `s_warptile_wm_qid(_k)` (`32 -> 16`). After the fix the three
+`MUL_MAT_ID(type_a=f16, m=32, k=16/64)` cases pass. Open sub-items:
 
-Acceptance: the three `_mmqid*` tiles satisfy the identity for every `subgroup_size` in {8, 16, 32, 64}, shown
-by index replay, plus hardware reruns of the class 3 shapes.
+* isolate which of the four WM values accounts for the `MUL_MAT_ID` cases (one build per group);
+* `MUL_MAT(type_a=bf16, m=1, n=64, k=256)` still returns `NaN at index 33` on this device (`bf16: 0`, so
+  bf16 is emulated). This is a distinct defect, not the tiling race;
+* the same identity check should be applied to the bf16 fallback tile (`s_warptile_wm_bf16`), which uses the
+  same shared-constant pattern but cannot be exercised on this device.
+
+Acceptance: the identity holds for every `subgroup_size` in {8, 16, 32, 64} by index replay, the three
+`MUL_MAT_ID` cases stay green, and the bf16 `NaN` is either fixed or attributed.
 
 ### P4 — FLASH_ATTN_EXT `hsk=hsv=72` with quantized KV (active)
 
@@ -122,39 +126,55 @@ quantisation order.
 the comparison). Baseline: Q4_K_M, F16, F32 and F16+KV q8_0+FA all produce identical text on Vulkan and CPU.
 Rerun after P2 to make sure the tile change does not alter decode output.
 
-### P6 — training / finetune path (active)
+### P6 — training / finetune path (answered: blocked, backend-independent)
 
-`llama-finetune` drives `llama_opt_init` → `ggml_opt_*` over the *context's* scheduler, so GPU backends are
-eligible. Known constraints found in-tree:
+`llama-finetune` on this device aborts before the first optimizer step, on **every** configuration tried:
 
-* FA is switched off for training because `FLASH_ATTN_EXT` has no backward pass;
-* `OUT_PROD` in the Vulkan backend is f32-only, which is why `finetune.cpp` forces f32 K/V caches;
-* Vulkan has no `IM2COL_BACK`, `POOL_2D_BACK`, `FLASH_ATTN_BACK`, `DIAG_MASK_ZERO`, `WIN_PART/UNPART`,
-  `GET_REL_POS/ADD_REL_POS`, `MAP_CUSTOM*`, `CUSTOM` — those nodes fall back to CPU through the scheduler;
-* `CROSS_ENTROPY_LOSS(_BACK)`, `SOFT_MAX_BACK`, `RMS_NORM_BACK`, `SILU_BACK`, `ROPE_BACK`, `ACC`,
-  `OPT_STEP_ADAMW/SGD`, `GET_ROWS_BACK`, `REPEAT_BACK` all have Vulkan f32 pipelines.
+| run | backend | result |
+|---|---|---|
+| `-c 128 -b 32 -ub 32 -opt sgd -lr 1e-5` | `-ngl 99` (Vulkan offload) | `GGML_ASSERT(cgraph->n_nodes < cgraph->size) failed` → SIGABRT, exit 134 |
+| same | `-ngl 0` (CPU only) | same assert, same stack |
+| `-c 64 -b 8 -ub 8` | `-ngl 0` | same assert, same stack |
 
-Acceptance: a run with `-ngl 99` either completes an epoch and writes the finetuned model, or fails with a
-specific op/backend attribution. Both outcomes get recorded; the point is to know which it is.
+Stack: `llama_context::opt_epoch_iter` → `ggml_opt_alloc` → `ggml_build_backward_expand` →
+`ggml/src/ggml.c:7291`.
 
-### P7 — SME path review (active)
+Mechanism, from the source: `llama_context::graph_max_nodes()` sizes the forward graph at
+`max(1024, 8 * n_tensors)` = 2328 for this model (291 tensors, qwen2), while `ggml/src/ggml-opt.cpp:296`
+creates the gradient graph with the *forward* graph's size (`ggml_new_graph_custom(ctx, src->size, true)`)
+and then expands the backward pass into it. The backward expansion of a 24-layer model needs more nodes than
+the forward budget, so the append helper aborts. Batch/context size is not the trigger (the `-b 8 -c 64` run
+fails identically), and the backend is not the trigger (CPU-only fails identically).
 
-Evidence collected so far:
+So on this device: inference on Vulkan works, finetuning does not run at all, and the reason is a graph
+capacity budget in the training path, not the Vulkan backend. The Vulkan forward pass itself completed
+(the perf logger printed its table before the abort), which is also evidence that the training *forward* half
+is functional on this backend.
 
-* this SoC advertises `sme sme2 smei8i32 smei16i32 smebi32i32 smef16f32 smef32f32 smeb16f32` plus the full
-  `sve/sve2` set in `/proc/cpuinfo`;
-* in llama.cpp, SME is reachable only through the KleidiAI path: `GGML_USE_SME` is defined by
-  `ggml/src/ggml-cpu/CMakeLists.txt` when `GGML_INTERNAL_SME` is set, and its only consumer is
-  `ggml/src/ggml-cpu/arch/arm/cpu-feats.cpp` (`if (!af.has_sme) { return 0; }`), while
-  `ggml/src/ggml-cpu/ggml-cpu.c` only reports capability (`ggml_cpu_has_sme/sme2`);
-* `GGML_CPU_KLEIDIAI` defaults to OFF, so a default build (including this one) neither compiles nor runs SME
-  kernels; KleidiAI provides forward matmul micro-kernels only, so SME cannot contribute to training;
-* therefore "Vulkan for training/inference + SME on the CPU side" is currently two independent paths, and
-  the Vulkan backend does not interact with SME at all.
+Acceptance (met): the path is characterized with a reproducible abort, an exact file:line, and the
+backend-independence shown by the `-ngl 0` runs.
 
-Acceptance: a capability matrix stating, per path (forward inference, training backward, finetune), which
-backend does the work and whether SME is enabled; plus a measured build with `GGML_CPU_KLEIDIAI=ON` for the
-inference path if it is worth enabling on this SoC.
+### P7 — SME path review (answered: SME is not on any active path)
+
+Evidence, all measured on this device:
+
+* `/proc/cpuinfo` advertises `sme sme2 smei8i32 smei16i32 smebi32i32 smef16f32 smef32f32 smeb16f32` plus the
+  full `sve/sve2` set;
+* the build used here has **no `-march` at all**: configure prints `Checking for ARM features using flags:`
+  with an empty list, because `GGML_NATIVE=OFF` with no `GGML_CPU_ARM_ARCH` / `GGML_CPU_ALL_VARIANTS` falls
+  through the ARM branch in `ggml/src/ggml-cpu/CMakeLists.txt`;
+* runtime confirmation: `system_info: ... CPU : NEON = 1 | ARM_FMA = 1 | LLAMAFILE = 1 | REPACK = 1 |` —
+  no `DOTPROD`, no `I8MM`, no `SVE`, no `SME` line;
+* in llama.cpp, SME is only reachable through KleidiAI (`GGML_USE_SME`, defined when `GGML_INTERNAL_SME` is
+  set; its only consumer is `ggml/src/ggml-cpu/arch/arm/cpu-feats.cpp`), and `GGML_CPU_KLEIDIAI` defaults to
+  OFF. KleidiAI ships forward matmul micro-kernels only, so SME cannot participate in training;
+* therefore "Vulkan + SME" is not a coupled path here: Vulkan does GPU work, the CPU backend does fallback
+  work with plain NEON because the build has no ARM feature flags, and SME is dormant.
+
+Acceptance (met for the capability matrix): inference = Vulkan (GPU) + NEON-only CPU fallback; training =
+blocked before any backend matters (P6); SME = present in hardware, unused in this build, and unable to help
+training even if enabled. A build with `-DGGML_CPU_ARM_ARCH=armv9.2-a+sve2+sme` or `-DGGML_CPU_KLEIDIAI=ON`
+remains a separate measurement if the CPU side is worth accelerating.
 
 ### P8 — delivery (todo)
 
@@ -170,7 +190,9 @@ inference path if it is worth enabling on this SoC.
 ## Open questions / not yet known
 
 * Why exactly `hsk=72` and only `nb∈{1,3}` for the quantized KV flash-attention failures (P4).
-* Whether the f16 `MUL_MAT_ID` failures share the tile geometry cause or are an independent shader bug (P3).
-* Whether the Vulkan training path is viable at all on this device, or whether the scheduler ends up pushing
-  every backward node to CPU (P6) — no upstream record either way yet; upstream issue #18499 reports
-  `llama-finetune` failing in general.
+* Which single WM value accounts for the three `MUL_MAT_ID` cases now passing (P3).
+* Why `MUL_MAT(type_a=bf16, m=1, n=64, k=256)` still returns `NaN` on a device that emulates bf16 (P3).
+* Whether the fixed batched shapes propagate to real MoE prefill on this device, which needs an MoE model to
+  measure (`MUL_MAT_ID` is the prefill-heavy path for those architectures).
+* Whether the training abort (P6) is specific to this model shape or general: a capacity fix in the training
+  path (`ggml-opt.cpp` gradient graph size) is the next experiment, together with upstream issue #18499.

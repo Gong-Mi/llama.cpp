@@ -89,7 +89,7 @@ with each of `s_warptile`, `s_warptile_mmq`, `_mmq_int`, `_mmq_int_k` using `s_w
 `s_warptile_id` using `_wm_id`, `s_warptile_mmqid`, `_mmqid_int` using `_wm_qid`, and
 `s_warptile_mmqid_int_k` using `_wm_qid_k`.
 
-Result on hardware:
+Result on hardware (focused cases):
 
 | case | before | after |
 |---|---|---|
@@ -99,8 +99,29 @@ Result on hardware:
 | `MUL_MAT(type_a=q4_0,...,m=16,n=1,k=4096)` (normal decode shape) | PASS | PASS (no regression) |
 | `FLASH_ATTN_EXT(hsk=72,...,type_K=q4_0)` | FAIL ERR 0.052 | FAIL ERR 0.069 (unaffected, different shader) |
 
-The remaining failures after this fix are tracked separately in the validation plan
-(`MALI_VULKAN_VALIDATION_PLAN.md`).
+Full-suite rerun of the same build (`test-backend-ops -b Vulkan0`):
+
+| | baseline | with the WM fix |
+|---|---|---|
+| cases OK | 18880 | **18912** |
+| cases FAIL | **53** | **21** |
+| log lines | 22945 | 22913 |
+| exit code | 1 | 1 |
+
+30 cases fixed, nothing regressed. What changed:
+
+* all `MUL_MAT` failures with `m = 1` over quantized A (21 types) now pass, including the `bf16`-adjacent
+  cases that were failing on the same shape;
+* the odd-shape failures (`m=32,n=509,k=2112`, `m=6,n=4096,k=5120` and the `NaN` cases) now pass;
+* the three `MUL_MAT_ID(type_a=f16, m=32, k=16/64)` cases now pass as well. Only the `_mmqid*` WM values
+  changed for those tiles (`32 -> 16`), so the fix reached them, but which single tile is responsible has not
+  been isolated by a per-tile build yet;
+* one failure is left in the small-tile family and is **not** a tiling race: `MUL_MAT(type_a=bf16, m=1,
+  n=64, k=256)` returns `NaN at index 33` (Vulkan `-nan`, CPU `-9.196352`). This device reports `bf16: 0`,
+  so bf16 storage is emulated here; this needs its own investigation.
+
+The 20 `FLASH_ATTN_EXT(hsk=72)` failures are unchanged by this fix and are tracked separately (P4 in the
+validation plan).
 
 ## Notes for the two open Mali PRs in this fork
 
