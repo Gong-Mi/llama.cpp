@@ -121,7 +121,19 @@ Full-suite rerun of the same build (`test-backend-ops -b Vulkan0`):
   so bf16 storage is emulated here; this needs its own investigation.
 
 The 20 `FLASH_ATTN_EXT(hsk=72)` failures are unchanged by this fix and are tracked separately (P4 in the
-validation plan).
+validation plan). What is now known about them:
+
+* exact boundary - `hsk=hsv=72, nh=4, nr23=[4,1], kv=512, mask=0, nb∈{1,3}`, K/V ∈ {q4_0, q4_1, q5_0, q5_1,
+  q8_0}. All other combinations at `hsk=72` (f32/f16/bf16/iq4_nl, `nb∈{32,75}`, `mask=1`, `nr23=[1,1]`) pass,
+  and q8_0 fails by the same margin as q4_0, so this is not a quantization-accuracy effect;
+* repro (1 minute): `./test-backend-ops -b Vulkan0 -o FLASH_ATTN_EXT -p "hsk=72"` → 20 of 1010 FAIL, ERR
+  0.0175-0.0570 against a 0.0005 threshold;
+* isolation: forcing `split_k = 1` in `ggml_vulkan.cpp` at the split-K selection (7955-7969) makes the same
+  subset pass 1010/1010; forcing `split_k = 2` leaves 10 failures (only `nb=3`) and forcing `split_k = 64`
+  leaves 20 with a larger mean error. The defect is therefore in the split-K path, and its magnitude scales
+  with the number of splits;
+* logs: `findings-splitk/tbo-fa-hsk72-{nosplitk,splitk2,bigsplitk}.log`, plus the full-suite
+  `tbo-vulkan-wmfix.log`.
 
 ### Also measured: the fix does not change output, and decode gets faster
 

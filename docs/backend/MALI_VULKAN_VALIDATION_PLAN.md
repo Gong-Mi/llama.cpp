@@ -24,9 +24,9 @@ evidence that sets it, and the command that closes it. States: `done`, `active`,
    ┌───────────────────────────────┐        ┌────────────────────────────────────┐
    │ P2  WM identity fix           │        │ P4  FLASH_ATTN_EXT hsk=72 + q KV   │
    │  (s_warptile_wm and friends)  │        │  independent of P2 (verified:      │
-   │  state: done on hardware      │        │  still fails after the fix)        │
-   │  1a + 1b shapes PASS          │        │  state: active — cause unknown     │
-   │  full-suite rerun: see below  │        │  next: mm tile / K-quant dequant   │
+   │  state: done                  │        │  still fails after the fix)        │
+   │  1a + 1b shapes PASS          │        │  state: localized → split-K path   │
+   │  full suite: 18912 OK / 21 FAIL│       │  split_k=1 → 0 FAIL (1010 cases)   │
    └──────────────┬────────────────┘        └───────────────┬────────────────────┘
                   │                                          │
                   ▼                                          │
@@ -36,37 +36,44 @@ evidence that sets it, and the command that closes it. States: `done`, `active`,
    │  constant *or* by upstream    │                          │
    │  PR #27163 (mul_mat_          │                          │
    │  subgroup_size_32 stays 32)   │                          │
-   │  state: todo — 1c still open  │                          │
+   │  state: 1c green; bf16 NaN    │                          │
    └──────────────┬────────────────┘                          │
                   │                                          │
                   ▼                                          ▼
    ┌──────────────────────────────────────────────────────────────────────────────┐
    │ P5  end-to-end inference regression                                          │
    │  Q4_K_M / F16 / F32 / F16+KV q8_0+FA: Vulkan text == CPU text (逐字一致)      │
-   │  state: done on baseline; rerun after P2 before publishing                    │
+   │  state: done — identical text after P2 too, decode not slower                 │
    └──────────────┬───────────────────────────────────────────────────────────────┘
                   │
                   ▼
    ┌──────────────────────────────────────────────────────────────────────────────┐
    │ P6  training / finetune path (Vulkan)                                        │
    │  llama-finetune -ngl 99 ; which ops stay on CPU ; sched offload behaviour     │
-   │  state: active                                                               │
+   │  state: answered — aborts before step 1, backend-independent                  │
    └──────────────┬───────────────────────────────────────────────────────────────┘
                   │
                   ▼
    ┌──────────────────────────────────────────────────────────────────────────────┐
    │ P7  SME path review (CPU side of the same question)                          │
    │  SME/SME2 present on this SoC but only reachable via KleidiAI (default OFF)   │
-   │  state: active — build + capability evidence needed                          │
+   │  state: answered — no -march in build, runtime shows NEON only               │
    └──────────────┬───────────────────────────────────────────────────────────────┘
                   │
                   ▼
    ┌──────────────────────────────────────────────────────────────────────────────┐
    │ P8  delivery                                                                 │
    │  a) upstream issue #28637: hardware confirmation + independent fix check      │
-   │  b) our PR #27163: rebase (ARM_MALI enum gone) + extend to _mmqid* tiles      │
+   │  b) our PR #27163: rebase (ARM_MALI enum gone, build fails) + _mmqid* tiles   │
    │  c) our PR #27156: rebase/revalidate                                          │
-   │  state: todo — upstream text must be written by the account owner             │
+   │  state: docs pushed (this repo PR #4); upstream text is the owner's to write  │
+   └──────────────┬───────────────────────────────────────────────────────────────┘
+                  │
+                  ▼
+   ┌──────────────────────────────────────────────────────────────────────────────┐
+   │ P9  large-tile policy at 32KB shared memory                                  │
+   │  upstream #28531 does this for Samsung; this device also reports 32768       │
+   │  state: todo — perf only, correctness is P2                                  │
    └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -109,16 +116,54 @@ The three `s_warptile_mmqid*` tiles take `BLOCK_SIZE` from `mul_mat_subgroup_siz
 Acceptance: the identity holds for every `subgroup_size` in {8, 16, 32, 64} by index replay, the three
 `MUL_MAT_ID` cases stay green, and the bf16 `NaN` is either fixed or attributed.
 
-### P4 — FLASH_ATTN_EXT `hsk=hsv=72` with quantized KV (active)
+### P4 — FLASH_ATTN_EXT(hsk=72, quantized KV): localized to the split-K path
 
-20 cases, ERR 0.01–0.07 against a 5e-4 tolerance, pipeline `flash_attn_f32_f16`, unaffected by the WM fix
-and by `GGML_VK_DISABLE_COOPMAT`. Boundary that is known: the same shape with f32/f16/bf16/iq4_nl K/V passes,
-`hsk=64/80/96/128/192/256/320/512/576` with quantized KV pass, and only `nr23=[4,1], kv=512, mask=0,
-nb∈{1,3}` of the quantized `q*_0/q*_1/q8_0` cases fail.
+20 cases, ERR 0.0175–0.0570 against a 5e-4 tolerance, pipeline `flash_attn_f32_f16`, unaffected by the WM fix
+and by `GGML_VK_DISABLE_COOPMAT`. `hsk=64/80/96/128/192/256/320/512/576` with quantized KV all pass, so `hsk=72`
+(not a multiple of the 32/64 tile widths) plus a small query count is the trigger.
 
-Next steps: check the K-quant dequantisation path for `hsk=72` tile sizes in `flash_attn*` shaders (72 is not
-a multiple of the usual 32/64 tile widths), and confirm whether the reference itself (CPU) uses the same
-quantisation order.
+All 20 remaining failures are one signature: `hsk=hsv=72, nh=4, nr23=[4,1], kv=512, mask=0, nb∈{1,3}` with
+quantized K/V. The boundary is exact, taken from the two full-suite logs:
+
+| at `hsk=hsv=72, nr23=[4,1], kv=512, mask=0` | result |
+|---|---|
+| K/V ∈ {q4_0, q4_1, q5_0, q5_1, q8_0}, `nb ∈ {1,3}` | **FAIL** |
+| K/V ∈ {f32, f16, bf16, iq4_nl}, same shape and batch | OK |
+| same quantized K/V at `nb ∈ {32,75}` | OK |
+| same quantized K/V with `mask=1` | OK |
+| `nr23=[1,1]` (no GQA), any kv, any nb | OK |
+
+The error is not a precision drift: q8_0 (nearly lossless) fails by the same amount as q4_0 — ERR between
+0.0175 and 0.0570 against a 0.0005 threshold, and the values are type-independent.
+
+**Decisive isolation.** `split_k` was forced in the dispatch (`ggml_vulkan.cpp`, the block at 7955-7969) and the
+whole `hsk=72` subset (1010 cases) was rerun each time:
+
+| split_k | FAIL | which `nb` | ERR range | ERR mean |
+|---|---|---|---|---|
+| 1 (forced) | **0** | - | - | - |
+| 2 (forced) | 10 | 3 | 0.0161 - 0.0390 | 0.0262 |
+| natural (>1) | 20 | 1 and 3 | 0.0175 - 0.0569 | 0.0361 |
+| 64 (forced) | 20 | 1 and 3 | 0.0181 - 0.0753 | 0.0431 |
+
+So the failure lives in the split-K path, and its magnitude grows with the number of splits. With `split_k == 1`
+the identical shapes and types pass, which is why this is invisible for normal batch sizes and only appears for
+short sequences (few query rows make `split_k` large).
+
+Candidate sites, in order (not yet pinned):
+
+1. `flash_attn_base.glsl:181-182` — the split window: `start_j = split_k_index * p.split_kv / Bc` and
+   `end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc)`. `split_kv` is rounded to `alignment`,
+   which is `tuning_params.block_cols` (`ggml-vulkan.cpp:7894`), and `block_cols` depends on the K/V type, so
+   the window tiling is type-dependent - a plausible reason only the quantized types land in the bad geometry.
+2. The per-split partial store/merge pair, how many splits exist, and whether every split is visited. The store
+   layout in `flash_attn.comp:669-709` and the merge in `flash_attn_split_k_reduce.comp:34-35,103-105` were
+   checked by hand against each other and agree on index order (head in the split key, row inside), so the
+   mismatch, if any, is in the window arithmetic rather than in the layout.
+
+Next experiment: log `split_k`, `split_kv`, `start_j`, `end_j` per dispatch (VK debug facility or a temporary
+print) for a q4_0 and an f16 case at the same shape, to confirm whether f16 also takes `split_k > 1` and simply
+stays under tolerance, or takes `split_k == 1` and never exercises the path.
 
 ### P5 — end-to-end regression (done, also after the fix)
 
