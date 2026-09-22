@@ -120,11 +120,23 @@ Next steps: check the K-quant dequantisation path for `hsk=72` tile sizes in `fl
 a multiple of the usual 32/64 tile widths), and confirm whether the reference itself (CPU) uses the same
 quantisation order.
 
-### P5 — end-to-end regression (done on baseline)
+### P5 — end-to-end regression (done, also after the fix)
 
 `compare_vk_cpu.sh` compares generated text only (the `[ Prompt: ... | Generation: ... ]` line is not part of
 the comparison). Baseline: Q4_K_M, F16, F32 and F16+KV q8_0+FA all produce identical text on Vulkan and CPU.
-Rerun after P2 to make sure the tile change does not alter decode output.
+After the WM fix: still `TEXT-IDENTICAL: yes` (F16 and F32), and `llama-bench` shows decode at or above the
+baseline (Q4_K_M tg32 48.5 → 54.2 t/s, F16 tg32 28.1 → 38.0 t/s, two samples each).
+
+### P9 — 32KB shared-memory tile policy (todo, from the upstream sweep)
+
+Upstream PR #28531 disables large matmul tiles for Samsung devices because at 32KB shared memory the large
+tile quadruples accumulators per thread and collapses occupancy. This device reports the same 32768 bytes, so
+the same experiment is worth running for ARM Mali: disable `mul_mat_l` / `mul_mat_id_l` for the Mali case and
+measure `pp128+` with a larger `-ub`, then compare against the current large-tile selection. This is a
+performance question only; P2 already fixed correctness.
+
+Acceptance: prefill numbers with and without large tiles at `-ub 128/256`, sampled more than twice, with the
+model, batch and quantization recorded.
 
 ### P6 — training / finetune path (answered: blocked, backend-independent)
 

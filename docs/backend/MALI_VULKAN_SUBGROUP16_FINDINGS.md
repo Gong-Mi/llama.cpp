@@ -123,6 +123,48 @@ Full-suite rerun of the same build (`test-backend-ops -b Vulkan0`):
 The 20 `FLASH_ATTN_EXT(hsk=72)` failures are unchanged by this fix and are tracked separately (P4 in the
 validation plan).
 
+### Also measured: the fix does not change output, and decode gets faster
+
+Text equivalence against CPU (`compare_vk_cpu.sh`, generated text only) after the fix: `TEXT-IDENTICAL: yes`
+for F16 and for F32, both producing `The capital of France is Paris.`
+
+`llama-bench -ngl 99`, same two models, before → after:
+
+| model | test | baseline | with the WM fix |
+|---|---|---|---|
+| qwen2 630M Q4_K_M | pp128 | 69.06 ± 0.50 | 70.91 ± 0.13 |
+| qwen2 630M Q4_K_M | tg32 | 48.47 ± 5.35 | 54.23 ± 4.55 |
+| qwen2 630M F16 | pp128 | 67.43 ± 1.63 | 67.12 ± 2.51 |
+| qwen2 630M F16 | tg32 | 28.08 ± 2.18 | 37.95 ± 2.66 |
+
+Decode moves the most (+12% to +35%); both runs are only two samples each, so the numbers are indicative
+rather than a tuning claim. The point is that correcting the geometry does not cost performance here.
+
+## Recent upstream Vulkan activity, filtered for ARM/Mali relevance
+
+Checked against upstream `ggml-org/llama.cpp` (path `ggml/src/ggml-vulkan`, plus issues/PR search), because the
+local clone is a depth-1 checkout and cannot answer this from `git log`:
+
+* **no ARM/Mali-specific Vulkan commit is merged in the recent window.** The vendor-specific tile tuning that
+  did land targets other vendors (Intel f16 B-type + warp tile tuning #27471, Intel Xe GEMM work, AMD RDNA
+  workarounds, NVIDIA queuesubmit/argsort workarounds, PowerVR dmmv fallback #28341). The one merged commit
+  that touches warp geometry generally is #27726 ("warptiles currently assume warp sizes <= 64, clamp to work
+  around larger warps"), which was already present in the tested master;
+* the defect this document is about is open as **#28637** (small matmul warptile mis-tiles at subgroup size 16),
+  and it is the only open report filed against this exact GPU model;
+* other open items worth tracking from the same sweep: **#28531** ("disable large matmul tile on Samsung GPUs
+  with 32KB shared memory" — this device also reports `shared memory: 32768`, so the same policy question
+  applies; the PR currently gates on `VK_VENDOR_ID_SAMSUNG` only), #29254 (F32 A matrix 2-aligned loads in
+  `mul_mat_vec`), #29139 (hide internal symbols to prevent duplicate-dlopen state destruction — relevant to the
+  Termux/Android dlopen case), #27703, #27952, #28507;
+* Termux-specific toolchain reports: #28234 (Vulkan builds on Termux fail to optimise shaders) and the closed
+  #13918 (`vulkan-shaders-gen` build for Termux);
+* training: #18499 ("llama-finetune won't work even with 17M parameters") matches the abort reported in the
+  validation plan;
+* older Mali reports are closed/stale: #23241 (MUL_MAT wrong on Mali-G720), #23133 (Mali-G720 nonsense output),
+  #23057 (descriptor set assert on ARM UMA), #26921 (Mali-G925 NaN logits), #23359 (Mali hang when the host app
+  is backgrounded).
+
 ## Notes for the two open Mali PRs in this fork
 
 * `vulkan: optimize ARM Mali subgroup warptiles` (upstream #27163, branch `vulkan-mali-optimization`) takes the
