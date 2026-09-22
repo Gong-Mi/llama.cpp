@@ -206,12 +206,14 @@ Clean CPU-only bench (idle device, `-ngl 0 -p 32 -n 8 -r 2 -t 4`, qwen2.5-0.5b F
 
 | build | pp32 | tg8 |
 |---|---|---|
-| `-march=armv9.2-a+sve2+sme` | **209.47 t/s** | **21.63 t/s** |
-| baseline, no `-march` (bare aarch64) | 16.85 t/s | 2.60 t/s |
+| `-march=armv9.2-a+sve2+sme` | **206.64 ± 0.98 t/s** | **49.11 ± 2.84 t/s** |
+| baseline, no `-march` (bare aarch64) | 17.94 ± 0.78 t/s | 3.26 ± 0.21 t/s |
 
-That is a 12x prefill and 8x decode difference from the `-march` flag alone (single sample each in the first
-pass; the r=2 rerun is in `sme-verify2.log`). It is the single highest-leverage switch for CPU fallback on this
-device and costs nothing at runtime - but note it is SVE2 doing the work, not SME.
+That is **11.5x prefill and 15x decode** from the `-march` flag alone - free at runtime, and the single
+highest-leverage switch for CPU fallback on this device. Note it is **SVE2** doing the work, not SME: the
+49 t/s decode works out to ~57 GB/s of weight traffic, i.e. LPDDR5X-bandwidth-bound rather than blocked on the
+matrix units. Correctness of the SVE2 code: `test-backend-ops -b CPU -o MUL_MAT` on the same build gives
+**1325 OK / 0 FAIL** (`TBO_CPU_EXIT=0`, log `tbo-cpu-sme-mulmat.log`).
 
 So `-march=armv9.2-a+sve2+sme` produces real SVE/SVE2 code but **no SME instructions at all** - nothing in
 `ggml/src/ggml-cpu` uses SM/ZA. The only SME consumer in the tree is KleidiAI, gated behind
