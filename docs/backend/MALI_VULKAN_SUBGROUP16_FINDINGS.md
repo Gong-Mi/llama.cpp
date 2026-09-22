@@ -126,14 +126,24 @@ validation plan). What is now known about them:
 * exact boundary - `hsk=hsv=72, nh=4, nr23=[4,1], kv=512, mask=0, nb∈{1,3}`, K/V ∈ {q4_0, q4_1, q5_0, q5_1,
   q8_0}. All other combinations at `hsk=72` (f32/f16/bf16/iq4_nl, `nb∈{32,75}`, `mask=1`, `nr23=[1,1]`) pass,
   and q8_0 fails by the same margin as q4_0, so this is not a quantization-accuracy effect;
+* the physical head size is 96, not 72: the test pads for quantized types
+  (`tests/test-backend-ops.cpp:7781`, `hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K))`). The row stays
+  block-aligned, so "72 is not a multiple of 32" is not the mechanism; that earlier guess is withdrawn;
 * repro (1 minute): `./test-backend-ops -b Vulkan0 -o FLASH_ATTN_EXT -p "hsk=72"` → 20 of 1010 FAIL, ERR
   0.0175-0.0570 against a 0.0005 threshold;
 * isolation: forcing `split_k = 1` in `ggml_vulkan.cpp` at the split-K selection (7955-7969) makes the same
   subset pass 1010/1010; forcing `split_k = 2` leaves 10 failures (only `nb=3`) and forcing `split_k = 64`
   leaves 20 with a larger mean error. The defect is therefore in the split-K path, and its magnitude scales
   with the number of splits;
-* logs: `findings-splitk/tbo-fa-hsk72-{nosplitk,splitk2,bigsplitk}.log`, plus the full-suite
-  `tbo-vulkan-wmfix.log`.
+* dispatch geometry (`GGML_VK_DEBUG_FA_SPLIT=1`, 1010 dispatches) narrows it further: at the failing shape the
+  passing f16 case and the failing quantized case have identical `Br=4`, `split_k=8`, `split_kv=64` and
+  `wg=(1,4,1)`; only `Bc` differs (64 vs 32). Non-GQA quantized cases with `Bc=32` and `split_k` up to 8 pass,
+  so the remaining signature is GQA + `Bc=32` + `split_k>1`;
+* exonerated: the K/V split window arithmetic (identical to the passing f16 case), the shared-memory K staging
+  (`SHMEM_STAGING` is 0 off NVIDIA, so `kvsh` is not compiled in), and `use_dequant_kv` (that gate is false for
+  all 1010 cases on this device, so forcing it away changed nothing - inconclusive, not negative);
+* logs: `findings-splitk/tbo-fa-hsk72-{nosplitk,splitk2,bigsplitk}.log`, the dispatch log
+  `fa-split-dbg.log`, plus the full-suite `tbo-vulkan-wmfix.log`.
 
 ### Also measured: the fix does not change output, and decode gets faster
 
@@ -151,6 +161,63 @@ for F16 and for F32, both producing `The capital of France is Paris.`
 
 Decode moves the most (+12% to +35%); both runs are only two samples each, so the numbers are indicative
 rather than a tuning claim. The point is that correcting the geometry does not cost performance here.
+
+## Ops that are missing or gated, and which are worth adding here
+
+Two questions get mixed up: "which ops never run on the GPU" and "which ops would a real model need". Measured
+answers for this device:
+
+**a) In a real model graph, nothing is missing.** `GGML_SCHED_DEBUG=2 ./llama-cli -v -ngl 99` on qwen2.5-0.5b F16
+gives 486 nodes per graph evaluation with exactly **one** node off the GPU: `node #0 GET_ROWS(embd)`, the
+token-embedding lookup, which llama.cpp keeps on the host for the input split by design. Everything else - 169
+`MUL_MAT`, 120 `ADD`, 49 `RMS_NORM`, 49 `MUL`, 48 `ROPE`, 24 `FLASH_ATTN`, 24 `SWIGLU`, 2 `GET_ROWS` - runs on
+Vulkan0. (Log: `sched-debug.log`.)
+
+**b) The 12 ops that never go to the GPU are unused by this code base.** `DIAG_MASK_ZERO`, `IM2COL_BACK`,
+`POOL_2D_BACK`, `FLASH_ATTN_BACK`, `WIN_PART`, `WIN_UNPART`, `GET_REL_POS`, `ADD_REL_POS`, `MAP_CUSTOM1/2/3`,
+`CUSTOM`: **zero** references in `src/`, `examples/` or `tools/`. They exist for other ggml consumers (conv
+training, Swin, T5 relative positions), not for llama-family inference. Adding them buys nothing here.
+
+**c) The real gap is the training graph, not inference.** Every backward/optimizer op the training path uses
+already has a Vulkan branch in `supports_op`: `OUT_PROD`, `CROSS_ENTROPY_LOSS(_BACK)`, `SOFT_MAX_BACK`,
+`OPT_STEP_ADAMW`, `RMS_NORM_BACK`, `SILU_BACK`, `ROPE_BACK`, `ACC`, `GET_ROWS_BACK`, `REPEAT_BACK`. The only one
+with **no** branch anywhere in `ggml-vulkan.cpp` is `FLASH_ATTN_BACK` (0 matches). Most training branches are
+f32-only (`OUT_PROD`: contiguous f32/f32/f32; `ACC`: f32; `GET_ROWS_BACK`: f32; `CROSS_ENTROPY_LOSS`: f32), so
+a mixed-precision training graph would still fall back to CPU. Consequence: `FLASH_ATTN_BACK` is the single
+op-level item that would matter for training, but training does not reach the first step today (see the plan's
+P6), and it is the heaviest of the remaining items.
+
+**d) Gated shapes worth watching** (implemented, refused for specific inputs): `MUL_MAT` refuses non-contiguous
+dim01 and `nr=[1,2]`; `FLASH_ATTN_EXT` refuses `q1_0/q2_0` KV; `CPY`/`SET_ROWS` use a type whitelist; `CONV_2D`
+needs `cwhn=1`/specific dilations; `SSM_SCAN` (Mamba family) and `DSV4_HC_PRE` (DeepSeek-V4 hyper-connections)
+each have a single refused case - those two extend real architecture coverage rather than correctness coverage.
+
+## SME on this device: what the build actually produces
+
+| step | measured result |
+|---|---|
+| hardware | all 8 cores report `sme sme2 smei8i32 smei16i32 smebi32i32 smef16f32 smef32f32 ... sve sve2 i8mm asimddp` (`/proc/cpuinfo`); two core types (`CPU part 0xd8b` x4, `0xd90` x4) |
+| configure | `Performing Test HAVE_SME - Success`; `Adding CPU backend variant ggml-cpu: -march=armv9.2-a+sve2+sme` |
+| baseline build (`GGML_CPU_ARM_ARCH` unset) | `quants.c.o` / `repack.cpp.o` / `vec.cpp.o` / `ops.cpp.o`: **0 SVE, 0 SME** instructions |
+| SME build | same objects: **SVE 20 / 2 / 32 / 356**; 934 predicate-register uses in `ops.cpp.o`; ZA tile registers and `smstart`/`fmopa`: **0** |
+| runtime + per-op correctness + bench | `sme-verify2.log`, `tbo-cpu-sme-mulmat.log` |
+
+Clean CPU-only bench (idle device, `-ngl 0 -p 32 -n 8 -r 2 -t 4`, qwen2.5-0.5b F16):
+
+| build | pp32 | tg8 |
+|---|---|---|
+| `-march=armv9.2-a+sve2+sme` | **209.47 t/s** | **21.63 t/s** |
+| baseline, no `-march` (bare aarch64) | 16.85 t/s | 2.60 t/s |
+
+That is a 12x prefill and 8x decode difference from the `-march` flag alone (single sample each in the first
+pass; the r=2 rerun is in `sme-verify2.log`). It is the single highest-leverage switch for CPU fallback on this
+device and costs nothing at runtime - but note it is SVE2 doing the work, not SME.
+
+So `-march=armv9.2-a+sve2+sme` produces real SVE/SVE2 code but **no SME instructions at all** - nothing in
+`ggml/src/ggml-cpu` uses SM/ZA. The only SME consumer in the tree is KleidiAI, gated behind
+`-DGGML_CPU_KLEIDIAI=ON` (default OFF), which downloads `kleidiai-1.24.0-src.tar.gz` from ARM-software/kleidiai
+via FetchContent (`ggml/src/ggml-cpu/CMakeLists.txt:586-613`) and provides forward matrix-multiplication
+micro-kernels only. Enabling it is the only way to reach SME in inference here, and it cannot help training.
 
 ## Recent upstream Vulkan activity, filtered for ARM/Mali relevance
 

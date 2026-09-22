@@ -119,22 +119,32 @@ Acceptance: the identity holds for every `subgroup_size` in {8, 16, 32, 64} by i
 ### P4 — FLASH_ATTN_EXT(hsk=72, quantized KV): localized to the split-K path
 
 20 cases, ERR 0.0175–0.0570 against a 5e-4 tolerance, pipeline `flash_attn_f32_f16`, unaffected by the WM fix
-and by `GGML_VK_DISABLE_COOPMAT`. `hsk=64/80/96/128/192/256/320/512/576` with quantized KV all pass, so `hsk=72`
-(not a multiple of the 32/64 tile widths) plus a small query count is the trigger.
+and by `GGML_VK_DISABLE_COOPMAT`. `hsk=64/80/96/128/192/256/320/512/576` with quantized KV all pass.
 
-All 20 remaining failures are one signature: `hsk=hsv=72, nh=4, nr23=[4,1], kv=512, mask=0, nb∈{1,3}` with
-quantized K/V. The boundary is exact, taken from the two full-suite logs:
+**Correction after instrumenting the dispatch:** the physical head size is *not* 72. The test pads it for
+quantized types (`tests/test-backend-ops.cpp:7781`, `hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K))`), so
+these cases run with `HSK = HSV = 96` (three 32-element blocks per row) while carrying the name `hsk=72`. The
+row width is block-aligned, so "hsk=72 is not a multiple of 32" is *not* the mechanism and was a wrong guess.
 
-| at `hsk=hsv=72, nr23=[4,1], kv=512, mask=0` | result |
-|---|---|
-| K/V ∈ {q4_0, q4_1, q5_0, q5_1, q8_0}, `nb ∈ {1,3}` | **FAIL** |
-| K/V ∈ {f32, f16, bf16, iq4_nl}, same shape and batch | OK |
-| same quantized K/V at `nb ∈ {32,75}` | OK |
-| same quantized K/V with `mask=1` | OK |
-| `nr23=[1,1]` (no GQA), any kv, any nb | OK |
+What the dispatch log (1010 cases, `GGML_VK_DEBUG_FA_SPLIT=1`) actually shows at the failing shape
+(`nr23=[4,1], kv=512, mask=0`):
+
+| case | Br | Bc | split_k | split_kv | wg | result |
+|---|---|---|---|---|---|---|
+| f16 / bf16 / f32 (`HSK=72`) | 4 | 64 | 8 | 64 | (1,4,1) | **OK** |
+| quantized (`HSK=96`) | 4 | **32** | 8 | 64 | (1,4,1) | **FAIL** |
+| quantized, non-GQA, `HSK=96` | 1-32 | 32/64 | 2..8 | 64..256 | - | **OK** |
+
+So the geometry that fails is: GQA (`gqa_ratio=4`) + `Bc=32` + `split_k>1` + quantized K/V. The split window
+arithmetic is identical to the passing f16 case (same `split_k=8`, `split_kv=64`, same workgroups), which
+exonerates it. Two other candidate paths are also out: the shared-memory K staging (`SHMEM_STAGING` is 0 on
+non-NVIDIA, so `kvsh` is not compiled in), and forcing `use_dequant_kv` had no effect because that gate is
+false on this device for every one of the 1010 cases (`dequant_kv=0` throughout; the experiment is therefore
+inconclusive, not negative).
 
 The error is not a precision drift: q8_0 (nearly lossless) fails by the same amount as q4_0 — ERR between
-0.0175 and 0.0570 against a 0.0005 threshold, and the values are type-independent.
+0.0175 and 0.0570 against a 0.0005 threshold, and the values are type-independent across the five quantized
+types. The full boundary (all four quadrants of the shape matrix) is in the findings document.
 
 **Decisive isolation.** `split_k` was forced in the dispatch (`ggml_vulkan.cpp`, the block at 7955-7969) and the
 whole `hsk=72` subset (1010 cases) was rerun each time:
@@ -152,18 +162,20 @@ short sequences (few query rows make `split_k` large).
 
 Candidate sites, in order (not yet pinned):
 
-1. `flash_attn_base.glsl:181-182` — the split window: `start_j = split_k_index * p.split_kv / Bc` and
-   `end_j = CEIL_DIV(min(KV, (split_k_index + 1) * p.split_kv), Bc)`. `split_kv` is rounded to `alignment`,
-   which is `tuning_params.block_cols` (`ggml-vulkan.cpp:7894`), and `block_cols` depends on the K/V type, so
-   the window tiling is type-dependent - a plausible reason only the quantized types land in the bad geometry.
-2. The per-split partial store/merge pair, how many splits exist, and whether every split is visited. The store
-   layout in `flash_attn.comp:669-709` and the merge in `flash_attn_split_k_reduce.comp:34-35,103-105` were
-   checked by hand against each other and agree on index order (head in the split key, row inside), so the
-   mismatch, if any, is in the window arithmetic rather than in the layout.
+1. `Bc=32` under GQA + split. It is the only geometry difference between the failing quantized cases and the
+   passing f16 cases at the same shape (`Br=4`, `split_k=8`, `split_kv=64`, `wg=(1,4,1)` on both sides), and
+   non-GQA quantized cases with `Bc=32` and `split_k` up to 8 pass. Cleanest test: force `block_cols = 64` for
+   the quantized GQA configuration (`get_fa_tuning_params_scalar`) and rerun the subset.
+2. The per-split partial store/merge pair, specifically the GQA store branch (`flash_attn.comp:669-688`, which
+   writes `o_offset` keyed by `(split, head, batch)` with the row inside) against the merge in
+   `flash_attn_split_k_reduce.comp:34-35,103-105`. Checked by hand and index order agrees, but the hand check
+   assumed `p.ne1` is the row count on both sides; a read-back of the partial buffers would settle it.
+3. Nothing in the K/V window arithmetic (`flash_attn_base.glsl:181-182`): the f16 case at the same shape takes
+   the same `split_k`/`split_kv`, so the windows are not the discriminator.
 
-Next experiment: log `split_k`, `split_kv`, `start_j`, `end_j` per dispatch (VK debug facility or a temporary
-print) for a q4_0 and an f16 case at the same shape, to confirm whether f16 also takes `split_k > 1` and simply
-stays under tolerance, or takes `split_k == 1` and never exercises the path.
+Next experiment (definitive if it works): read the split-K partial buffers back on the host for one failing
+case and one passing case, recompute the merge manually, and see whether the partial `m`/`L`/`O` written by the
+main shader are already wrong or whether the merge is.
 
 ### P5 — end-to-end regression (done, also after the fix)
 
